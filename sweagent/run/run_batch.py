@@ -71,6 +71,37 @@ from sweagent.utils.log import (
     set_stream_handler_levels,
 )
 
+### Changes
+from sera.constants import (
+    SYNTHETIC_TRAJ_PROMPT, 
+    CHECK_SYNTHETIC_TRAJ_PROMPT, 
+    ROLLOUT_ONE_PROMPTS,
+    SWEBENCH_PRS
+)
+from sweagent.run.sera_sweagent_utils import (
+    pp_query, 
+    pp_regex, 
+    parse_trajectory
+)
+### Changes
+
+class PipelinePromptsConfig(BaseSettings, cli_implicit_flags=False):
+    """
+    Optional config for running the SVG/pipeline flow.
+    If omitted (RunBatchConfig.pipeline is False/None), we run the normal SWE-agent flow.
+    """
+    # Synthetic PR generation prompts
+    synthetic_traj_prompt: str = ""
+    check_synthetic_traj_prompt: str = ""
+
+    # Rollout one bug type prompts
+    rollout_one_prompts: list[str] = Field(default_factory=list)
+    """
+    A list of prompts/templates to use for the "rollout_one" stage (if your pipeline uses it).
+    """
+
+    # Real synthetic issues
+    swebench_prs: list[str] = Field(default_factory=list)
 
 class RunBatchConfig(BaseSettings, cli_implicit_flags=False):
     instances: BatchInstanceSourceConfig = Field(description="Instances to run.")
@@ -96,6 +127,28 @@ class RunBatchConfig(BaseSettings, cli_implicit_flags=False):
     """Whether to show a progress bar. Progress bar is never shown for human models.
     Progress bar is always shown for multi-worker runs.
     """
+    ### Changes
+    keep_id: str = ""
+    skip_id: str = ""
+    """
+    Comma separated strings of instance ids/subids to keep or skip to run on subset of instances
+    """
+
+    pipeline: bool = False
+    """
+    Whether to run SVG, if False then normal SWE-agent is run.
+    """
+
+    pipeline_repo: str = ""
+    """
+    Name of swebench repo to specialize to OR a JSON file path containing list of custom PR issues.
+    """
+
+    pipeline_prompts: PipelinePromptConfig = Field(default_factory=PipelinePromptConfig)
+    """
+    Config defining prompts for SVG pipeline.
+    """
+    ### Changes
 
     # pydantic config
     model_config = SettingsConfigDict(extra="forbid", env_prefix="SWE_AGENT_")
@@ -147,6 +200,13 @@ class RunBatch:
         num_workers: int = 1,
         progress_bar: bool = True,
         random_delay_multiplier: float = 0.3,
+        ### Changes
+        keep_id: str = "",
+        skip_id: str = "",
+        pipeline: bool = False,
+        pipeline_repo: str = "",
+        pipeline_prompts: PipelinePromptConfig = Field(default_factory=PipelinePromptConfig)
+        ### Changes
     ):
         """Note: When initializing this class, make sure to add the hooks that are required by your actions.
         See `from_config` for an example.
@@ -185,6 +245,43 @@ class RunBatch:
         self._show_progress_bar = progress_bar
         self._random_delay_multiplier = random_delay_multiplier
 
+        ### Changes
+        self._keep_id = keep_id.split(",")
+        self._skip_id = skip_id.split(",")
+        self._pipeline = pipeline
+        self._pipeline_repo = pipeline_repo
+        self._pipeline_prompts = pipeline_prompts
+        
+        if self._pipeline and self._pipeline_repo:
+            if os.path.isfile(self._pipeline_repo):
+                try:
+                    with open(self._pipeline_repo, "r") as f:
+                        self._demonstration_issues = json.load(f)
+                except json.JSONDecodeError as e:
+                    print("Invalid json file for demonstration issues, using SWE Bench PRs instead")
+                    self._demonstration_issues = [v for k, v in self._pipeline_prompts.swebench_prs.items()]
+                if not self._demonstration_issues: # Handle empty list
+                    self._demonstration_issues = [v for k, v in self._pipeline_prompts.swebench_prs.items()]
+            else:
+                for k, v in self._pipeline_prompts.swebench_prs.items():
+                    self._demonstration_issues = [v for k, v in self._pipeline_prompts.swebench_prs.items() if self._pipeline_repo.lower() in k]
+                if not self._demonstration_issues:
+                    print(f"{self._pipeline_repo} is either not a file or not a valid identifier in SWE Bench, setting demostration PRs to all SWE Bench PRs")
+                    self._demonstration_issues = [v for k, v in self._pipeline_prompts.swebench_prs.items()]
+        elif self._pipeline:
+            self._demonstration_issues = [v for k, v in self._pipeline_prompts.swebench_prs.items()]
+        else:
+            self._demonstration_issues = None
+        if self._demonstration_issues:
+            print(f"{len(self._demonstration_issues)} demonstration issues loaded")
+        if self._pipeline:
+            print("Pipeline Prompts:")
+            print(f"Create Synthetic Issue: {self._pipeline_prompts.synthetic_traj_prompt}")
+            print(f"Check Trajectory Against Rollout One Prompt: {self._pipeline_prompts.check_synthetic_traj_prompt}")
+            print(f"SVG Rollout One Prompt (first idx): {self._pipeline_prompts.rollout_one_prompts[0]}")
+            print(f"Demonstration Issue (first idx): {self._demonstration_issues[0]}")
+        ### Changes
+
     @property
     def _model_id(self) -> str:
         try:
@@ -219,6 +316,12 @@ class RunBatch:
             num_workers=config.num_workers,
             progress_bar=config.progress_bar,
             random_delay_multiplier=config.random_delay_multiplier,
+            ### Changes
+            keep_id=config.keep_id,
+            skip_id=config.skip_id,
+            pipeline=config.pipeline,
+            pipeline_repo=config.pipeline_repo,
+            ### Changes
         )
         if isinstance(config.instances, SWEBenchInstances) and config.instances.evaluate:
             from sweagent.run.hooks.swe_bench_evaluate import SweBenchEvaluate
@@ -265,19 +368,37 @@ class RunBatch:
                     self.logger.info("Stopping loop over instances")
                     break
 
+    ### Changes
+    # We modify this to retry the trajectory based on failures related to OS, CPU, network instability
     def main_multi_worker(self) -> None:
         add_logger_names_to_stream_handlers()
         # Set all stream handlers to WARNING and set everything where we want to have
         # more verbosity explicitly
-        set_stream_handler_levels(logging.WARNING)
-        self.logger.setLevel(logging.TRACE)  # type: ignore
+        set_stream_handler_levels(logging.ERROR)
+        self.logger.setLevel(logging.ERROR)  # type: ignore
 
         with Live(self._progress_manager.render_group):
             with ThreadPoolExecutor(max_workers=self._num_workers) as executor:
-                futures = [executor.submit(self.run_instance, instance) for instance in self.instances]
+                tasks_to_process = {executor.submit(self.run_instance, instance) for instance in self.instances}
+
                 try:
-                    for future in as_completed(futures):
-                        future.result()
+                    while tasks_to_process:
+                        # Wait for at least one task in our set to finish.
+                        # 'wait' returns two new sets without affecting the running tasks.
+                        completed_tasks, pending_tasks = wait(tasks_to_process, return_when=FIRST_COMPLETED)
+
+                        # 1. Process the results of the tasks that just finished.
+                        for future in completed_tasks:
+                            result = future.result()
+                            if result is not None:
+                                # If we get a new task, submit it and add the new future
+                                # to the set of pending tasks.
+                                print(f"Adding {result.problem_statement.id} to retry...")
+                                new_future = executor.submit(self.run_instance, result)
+                                pending_tasks.add(new_future)
+                        # 2. For the next loop, our set of tasks to process is now the
+                        #    set of tasks that were already pending plus any new ones we just added.
+                        tasks_to_process = pending_tasks
                 except (KeyboardInterrupt, _BreakLoop):
                     msg = (
                         "Received keyboard interrupt, waiting for running instances "
@@ -288,8 +409,9 @@ class RunBatch:
                 finally:
                     self._progress_manager.print_report()
 
+    # Changes
     def run_instance(self, instance: BatchInstance) -> None:
-        self.logger.info("Running on instance %s", instance.problem_statement.id)
+        self.logger.error("Running on instance %s", instance.problem_statement.id)
         register_thread_name(instance.problem_statement.id)
         self._add_instance_log_file_handlers(instance.problem_statement.id, multi_worker=self._num_workers > 1)
         # Let's add some randomness to avoid any potential race conditions or thundering herd
@@ -298,17 +420,27 @@ class RunBatch:
 
         self._progress_manager.on_instance_start(instance.problem_statement.id)
 
-        if previous_exit_status := self.should_skip(instance):
-            self._progress_manager.on_instance_end(
-                instance.problem_statement.id, exit_status=f"skipped ({previous_exit_status})"
-            )
+        if self.should_skip(instance):
+            self._progress_manager.on_instance_end(instance.problem_statement.id, exit_status="skipped")
             self._remove_instance_log_file_handlers(instance.problem_statement.id)
             return
 
         # Either catch and silence exception, or raise _BreakLoop to stop the loop
         # over the instances
+        run_on_this = (self._skip_id[0] == "" or not any(id in instance.problem_statement.id for id in self._skip_id)) and \
+                (self._keep_id[0] == "" or any(id in instance.problem_statement.id for id in self._keep_id))
+
+        return_instance_for_retry = False
+        if "repo" in instance.problem_statement.extra_fields:
+            instance.problem_statement.extra_fields.pop("repo")
         try:
-            result = self._run_instance(instance)
+            ### Changes
+            if run_on_this:
+                if self._pipeline:
+                    result = self._run_instance_pipeline(instance)
+                else:
+                    result = self._run_instance(instance)
+            ### Changes
         except KeyboardInterrupt:
             raise _BreakLoop
         except (SystemExit, ModelConfigurationError, TotalCostLimitExceededError) as e:
@@ -322,13 +454,167 @@ class RunBatch:
             self._progress_manager.on_uncaught_exception(instance.problem_statement.id, e)
             if self._raise_exceptions:
                 raise
+            if (isinstance(e, CalledProcessError) 
+                or isinstance(e, ConnectionError) 
+                or isinstance(e, HTTPError)
+                or isinstance(e, APITimeoutError)
+                or isinstance(e, ClientConnectorError)
+                or isinstance (e, TimeoutError)):
+                self.logger.error(f"Signalling to retry {instance.problem_statement.id}...")
+                return_instance_for_retry = True
         else:
-            self._progress_manager.on_instance_end(
-                instance.problem_statement.id, exit_status=result.info.get("exit_status", "unknown_exit")
-            )
+            if not run_on_this:
+                self._progress_manager.on_instance_end(
+                    instance.problem_statement.id, exit_status=None
+                )
+            else:
+                self._progress_manager.on_instance_end(
+                    instance.problem_statement.id, exit_status=result.info.get("exit_status", "unknown_exit")
+                )        
+    
         finally:
             self._progress_manager.update_exit_status_table()
             self._remove_instance_log_file_handlers(instance.problem_statement.id)
+        if return_instance_for_retry:
+            return instance
+        else:
+            return
+    # Changes
+
+    ### Changes
+    def create_synth_inst(self, system_prompt, prompt, steps, example_pr, base_url, base_model):
+        retry_max = 10
+        try:
+            while True:
+                try:
+                    synth_pr = pp_regex(pp_query(base_url=base_url, model=base_model, system=system_prompt,
+                                                    prompt=prompt,
+                                                    api_key="",
+                                                    args={"agent_steps": json.dumps(steps),
+                                                            "demonstration_issue": example_pr}))
+                    # Only exit if 1) successful regex 2) no more retries
+                    if synth_pr or retry_max == 0:
+                        break
+                    else:
+                        retry_max -= 1
+                except Exception as e:
+                    # Retry if its a rate limit thing
+                    if "rate_limit_error" in str(e) or "overload" in str(e):
+                        time.sleep(10)
+                        retry_max -= 1
+                        if retry_max == 0:
+                            return None
+                    else:
+                        print(e)
+                        return None
+            # If regex fails, we return None
+            if synth_pr is None:
+                return None
+            else:
+                # Logging
+                return synth_pr[0]
+        except Exception as e:
+            # Catch any remaining exceptions
+            print(e)
+            return None
+
+    def _run_instance_pipeline(self, instance: BatchInstance) -> AgentRunResult:
+        retries = 3
+        for i in range(retries):
+            print(f"{instance.problem_statement.id}: pipeline attempt {i+1}/{retries}")
+            output_dir = Path(self.output_dir) / instance.problem_statement.id
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            # Add instance log handlers
+            self._add_instance_log_file_handlers(
+                instance.problem_statement.id,
+                multi_worker=self._num_workers > 1
+            )
+            self.agent_config.name = f"{instance.problem_statement.id}"
+            agent = get_agent_from_config(self.agent_config)
+            single_run_replay_config = RunSingleConfig(
+                agent=self.agent_config,
+                problem_statement=instance.problem_statement,
+                env=instance.env,
+            )
+            (output_dir / f"{instance.problem_statement.id}.config.yaml").write_text(
+                yaml.dump(single_run_replay_config.model_dump(), indent=2)
+            )
+            agent.replay_config = single_run_replay_config  # type: ignore[attr-defined]
+            agent.add_hook(SetStatusAgentHook(instance.problem_statement.id, self._progress_manager.update_instance_status))
+            self._progress_manager.update_instance_status(instance.problem_statement.id, "Starting environment")
+            instance.env.name = f"{instance.problem_statement.id}"
+            env = SWEEnv.from_config(instance.env)
+            env.add_hook(
+                SetStatusEnvironmentHook(instance.problem_statement.id, self._progress_manager.update_instance_status)
+            )
+            env.deployment.add_hook(
+                SetStatusDeploymentHook(instance.problem_statement.id, self._progress_manager.update_instance_status)
+            )
+            is_good_patch = False
+            try:
+                # Here are different prompts
+                agent.templates.instance_template = random.sample(self._pipeline_prompts.rollout_one_prompts, 1)[0]
+
+                # We add handling to load a previous simulated trajectory in directly as context.
+                extra_fields = instance.problem_statement.get_extra_fields()
+                env.start()
+                self._chooks.on_instance_start(index=0, env=env, problem_statement=instance.problem_statement)
+                result = agent.run(
+                    problem_statement=instance.problem_statement,
+                    env=env,
+                    output_dir=output_dir
+                )
+                metadata_file = output_dir / f"{instance.problem_statement.id}.synth"
+                is_good_patch_retry = 3
+                steps_truncation = 0
+                agent_trajectory = parse_trajectory(result.trajectory)
+                while True:
+                    try:
+                        is_good_patch_response = pp_query(system="You are a helpful assistant who can analyze code.", 
+                                                            prompt=self._pipeline_prompts.check_synthetic_traj_prompt,
+                                                            model=self.agent_config.model.name,
+                                                            base_url=self.agent_config.model.api_base,
+                                                            api_key=self.agent_config.model.api_key, args={"agent_steps": json.dumps(agent_trajectory[steps_truncation:]),
+                                                                                                            "initial_prompt": result.agent_history[1]["content"]}).lower()
+                    except openai.BadRequestError as e:
+                        print(f"Retrying: {e}")
+                    parsed_is_good_patch = pp_regex(is_good_patch_response)
+                    print(f"{instance.problem_statement.id}: {is_good_patch_response}")
+                    if parsed_is_good_patch:
+                        if parsed_is_good_patch[0].strip().lower() == "yes":
+                            is_good_patch = True
+                        break
+                    else:
+                        is_good_patch_retry -= 1
+                        steps_truncation += len(agent_trajectory) // 4
+                        if is_good_patch_retry == 0:
+                            break
+                synth_pr = self.create_synth_inst(system_prompt="You are a helpful assistant who can analyze code.",
+                                                    prompt=self._pipeline_prompts.synthetic_traj_prompt,
+                                                    steps=agent_trajectory[steps_truncation:],
+                                                    example_pr=random.sample(self._demonstration_issues, 1)[0],
+                                                    base_url=self.agent_config.model.api_base,
+                                                    base_model=self.agent_config.model.name)
+                with open(metadata_file, "w") as f:
+                    json.dump({"is_good_patch": is_good_patch, 
+                            "synth_pr": synth_pr}, 
+                            f, 
+                            indent=4)
+                    
+            except Exception:
+                # The actual handling is happening in `run_instance`, but we need to make sure that
+                # we log it to the agent specific logger as well
+                agent.logger.error(traceback.format_exc())  # type: ignore[attr-defined]
+                raise
+            finally:
+                env.close()
+            if is_good_patch:
+                break
+        save_predictions(self.output_dir, instance.problem_statement.id, result)
+        self._chooks.on_instance_completed(result=result)
+        return result
 
     def _run_instance(self, instance: BatchInstance) -> AgentRunResult:
         output_dir = Path(self.output_dir) / instance.problem_statement.id
@@ -399,11 +685,18 @@ class RunBatch:
                 self.logger.warning(f"Found existing trajectory with no exit status: {log_path}. Removing.")
                 log_path.unlink()
                 return False
+            # Changes
+            if "exit_error" in exit_status:
+                self.logger.warning(f"Found existing trajectory with exit error: {log_path}. Removing.")
+                log_path.unlink()
+                return False
+            # Changes
         except Exception as e:
             self.logger.error(f"Failed to check existing trajectory: {log_path}: {e}. Removing.")
             # If we can't check the trajectory, we will redo it
             log_path.unlink()
             return False
+
         # otherwise, we will skip it
         self.logger.info(f"⏭️ Skipping existing trajectory: {log_path}")
         return exit_status

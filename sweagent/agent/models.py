@@ -14,6 +14,7 @@ from typing import Annotated, Any, Literal
 
 import litellm
 import litellm.types.utils
+from openai import APITimeoutError
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict, Field, SecretStr
 from swerex.exceptions import SwerexException
@@ -821,12 +822,14 @@ class LiteLLMModel(AbstractModel):
                     litellm.exceptions.ContextWindowExceededError,
                     litellm.exceptions.APIError,
                     litellm.exceptions.ContentPolicyViolationError,
+                    litellm.exceptions.InternalServerError, # Change
                     TypeError,
                     litellm.exceptions.AuthenticationError,
                     ContentPolicyViolationError,
                     ModelConfigurationError,
                     KeyboardInterrupt,
                     IndexError,
+                    APITimeoutError # Change
                 )
             ),
             before_sleep=retry_warning,

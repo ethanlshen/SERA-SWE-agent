@@ -1,12 +1,64 @@
 # Modifications for SERA
+
 We make modifications in five files:
 - A new utils file in `sweagent/run/sera_sweagent_utils.py`
 - Major SVG pipeline logic in `sweagent/run/run_batch.py`
-- Slightly modify return logic in `sweagent/agent/models.py`
+- Slightly modify return logic in `sweagent/agent/agents.py`
 - Slightly modify AgentRunResult in `sweagent/types.py`
 - Slightly modify tool implementation in `tools/diff_state/bin/_state_diff_state`
 
-Changes are surrounded by ### Changes ### comments throughout the codebase.
+Changes are surrounded by `### Changes ###` comments throughout the codebase.
+
+## Detailed Change Log
+
+### `tools/diff_state/bin/_state_diff_state`
+- **Python compatibility fix**: Replaced f-string with string concatenation in the `subprocess.run` call so the script is compatible with earlier Python versions.
+
+### `sweagent/types.py`
+- **New field on `AgentRunResult`**: Added an `agent_history: list` field to carry the full trajectory history forward from the agent run.
+
+### `sweagent/agent/agents.py`
+- **Extended return value**: The agent's return statement now includes `agent_history=self.history` so that the SVG pipeline can inspect the conversation history after a run.
+
+### `sweagent/run/run_batch.py`
+This file contains the bulk of the changes, implementing the SVG (Synthetic Validation/Grading) pipeline.
+
+#### New configuration fields (`RunBatchConfig`)
+| Field | Type | Description |
+|-------|------|-------------|
+| `keep_id` | `str` | Comma-separated instance IDs/sub-IDs to include (substring match) |
+| `skip_id` | `str` | Comma-separated instance IDs/sub-IDs to exclude (substring match) |
+| `pipeline` | `bool` | Enable the SVG pipeline (default: normal SWE-agent) |
+| `pipeline_repo` | `str` | SWE-bench repo name or path to a JSON file of custom PR issues |
+| `pipeline_yaml` | `str` | Config file defining prompts for the SVG pipeline |
+
+#### Instance filtering (`run_instance`)
+- Instances are filtered by `keep_id` / `skip_id` before execution, using substring matching on the instance ID.
+
+#### Demonstration issue loading (`__init__`)
+Three cases are handled when the pipeline is enabled:
+1. **`pipeline=True` + `pipeline_repo` set** — loads demonstration issues from a JSON file or selects SWE-bench PRs matching the given repo name.
+2. **`pipeline=True` + no `pipeline_repo`** — uses all available SWE-bench PRs as demonstrations.
+3. **`pipeline=False`** — no demonstration issues are loaded (normal mode).
+
+#### Retry logic (`main_multi_worker` / `run_instance`)
+- `run_instance` now returns the instance object on transient failures (connection errors, timeouts, API errors, process errors) and `None` on success.
+- `main_multi_worker` uses `concurrent.futures.wait` to detect completed tasks and resubmits any that returned an instance for retry.
+- Instances with an `exit_error` status in a previous trajectory are automatically rerun instead of skipped.
+
+#### SVG pipeline (`_run_instance_pipeline`)
+The pipeline executes four steps per instance (with up to 3 retries):
+1. **Step 1** — Randomly sample a vague bug-fix prompt for the first rollout.
+2. **Step 2** — Run the agent on the instance with that prompt.
+3. **Step 3** — Grade the rollout trajectory against the initial prompt to decide if the patch is good.
+4. **Step 4** — If the patch is good, generate a synthetic issue from the trajectory using `create_synth_inst`; otherwise retry from Step 1.
+
+#### Synthetic issue creation (`create_synth_inst`)
+- Helper method that calls the LLM to produce a synthetic issue from an agent trajectory and a demonstration PR.
+- Includes retry logic for rate-limit and overload errors (up to 10 retries with back-off).
+
+### `sweagent/run/sera_sweagent_utils.py`
+- New utility file providing helper functions (`pp_query`, `pp_regex`, `parse_trajectory`, `PipelinePromptsConfig`, etc.) used by the SVG pipeline.
 
 <p align="center">
   <a href="https://swe-agent.com/latest/">

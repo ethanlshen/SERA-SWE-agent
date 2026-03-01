@@ -32,15 +32,18 @@ With [green]filter[/green], you can select specific instances, e.g., [green]--in
 import getpass
 import json
 import logging
+import os
 import random
+import shutil
 import sys
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Self
 
+import openai
 import yaml
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -72,12 +75,6 @@ from sweagent.utils.log import (
 )
 
 ### Changes
-from sera.constants import (
-    SYNTHETIC_TRAJ_PROMPT, 
-    CHECK_SYNTHETIC_TRAJ_PROMPT, 
-    ROLLOUT_ONE_PROMPTS,
-    SWEBENCH_PRS
-)
 from sweagent.run.sera_sweagent_utils import (
     pp_query, 
     pp_regex, 
@@ -86,13 +83,13 @@ from sweagent.run.sera_sweagent_utils import (
 ### Changes
 
 class PipelinePromptsConfig(BaseSettings, cli_implicit_flags=False):
+    # Synthetic PR generation prompts
+    synthetic_traj_prompt: str = ""
+    check_synthetic_traj_prompt: str = ""
     """
     Optional config for running the SVG/pipeline flow.
     If omitted (RunBatchConfig.pipeline is False/None), we run the normal SWE-agent flow.
     """
-    # Synthetic PR generation prompts
-    synthetic_traj_prompt: str = ""
-    check_synthetic_traj_prompt: str = ""
 
     # Rollout one bug type prompts
     rollout_one_prompts: list[str] = Field(default_factory=list)
@@ -101,7 +98,15 @@ class PipelinePromptsConfig(BaseSettings, cli_implicit_flags=False):
     """
 
     # Real synthetic issues
-    swebench_prs: list[str] = Field(default_factory=list)
+    swebench_prs: dict = Field(default_factory=dict)
+    """
+    PRs to use as demonstration issues. Override with RunBatchConfig.pipeline_repo.
+    """
+
+    @classmethod
+    def load(cls, path: str | Path):
+        data = yaml.safe_load(Path(path).read_text()) or {}
+        return cls.model_validate(data)  # strict type validation
 
 class RunBatchConfig(BaseSettings, cli_implicit_flags=False):
     instances: BatchInstanceSourceConfig = Field(description="Instances to run.")
@@ -127,7 +132,8 @@ class RunBatchConfig(BaseSettings, cli_implicit_flags=False):
     """Whether to show a progress bar. Progress bar is never shown for human models.
     Progress bar is always shown for multi-worker runs.
     """
-    ### Changes
+    ### Changes ###
+    # New input fields for SVG
     keep_id: str = ""
     skip_id: str = ""
     """
@@ -144,11 +150,10 @@ class RunBatchConfig(BaseSettings, cli_implicit_flags=False):
     Name of swebench repo to specialize to OR a JSON file path containing list of custom PR issues.
     """
 
-    pipeline_prompts: PipelinePromptConfig = Field(default_factory=PipelinePromptConfig)
+    pipeline_yaml: str = ""
     """
     Config defining prompts for SVG pipeline.
     """
-    ### Changes
 
     # pydantic config
     model_config = SettingsConfigDict(extra="forbid", env_prefix="SWE_AGENT_")
@@ -200,13 +205,13 @@ class RunBatch:
         num_workers: int = 1,
         progress_bar: bool = True,
         random_delay_multiplier: float = 0.3,
-        ### Changes
+        ### Changes ###
         keep_id: str = "",
         skip_id: str = "",
         pipeline: bool = False,
         pipeline_repo: str = "",
-        pipeline_prompts: PipelinePromptConfig = Field(default_factory=PipelinePromptConfig)
-        ### Changes
+        pipeline_yaml: str = ""
+        ### Changes ###
     ):
         """Note: When initializing this class, make sure to add the hooks that are required by your actions.
         See `from_config` for an example.
@@ -245,32 +250,43 @@ class RunBatch:
         self._show_progress_bar = progress_bar
         self._random_delay_multiplier = random_delay_multiplier
 
-        ### Changes
+        ### Changes ###
+        # Logging and handling for new parameters
+        # keep_id and skip_id specify tasks to run on/skip based on subword matches.
+        # pipeline, pipeline_repo, and pipeline_prompts are handled as follows:
+        # Case 1:
+        #   SVG pipeline and pipeline_repo defined, which selects for a sepcific set of demonstration synthetic PRs to use.
+        #   pipeline_repo can either be a keyword for a repository in SWE-Bench (`django`, `sympy`, etc.) or a JSON file with a list.
+        # Case 2:
+        #   SVG pipeline, but no pipeline_repo, which will use general SWE-Bench PRs as demonstration issues.
+        # Case 3:
+        #   No SVG pipeline, so do nothing.
+        # We handle three cases for loading demonstration issues.
         self._keep_id = keep_id.split(",")
         self._skip_id = skip_id.split(",")
         self._pipeline = pipeline
         self._pipeline_repo = pipeline_repo
-        self._pipeline_prompts = pipeline_prompts
+        self._pipeline_prompts = PipelinePromptsConfig.load(pipeline_yaml)
         
-        if self._pipeline and self._pipeline_repo:
-            if os.path.isfile(self._pipeline_repo):
+        if self._pipeline and self._pipeline_repo: # Case 1. Handle specific demonstration issues
+            if os.path.isfile(self._pipeline_repo): # Handle file to load demonstration issues
                 try:
                     with open(self._pipeline_repo, "r") as f:
                         self._demonstration_issues = json.load(f)
-                except json.JSONDecodeError as e:
+                except json.JSONDecodeError as e: # Handle failed load
                     print("Invalid json file for demonstration issues, using SWE Bench PRs instead")
                     self._demonstration_issues = [v for k, v in self._pipeline_prompts.swebench_prs.items()]
-                if not self._demonstration_issues: # Handle empty list
+                if not self._demonstration_issues: # Handle empty file
                     self._demonstration_issues = [v for k, v in self._pipeline_prompts.swebench_prs.items()]
-            else:
-                for k, v in self._pipeline_prompts.swebench_prs.items():
+            else: # Handle using existing demonstration issue
+                for k, v in self._pipeline_prompts.swebench_prs.items(): # Select demonstrations from a specific repository specified
                     self._demonstration_issues = [v for k, v in self._pipeline_prompts.swebench_prs.items() if self._pipeline_repo.lower() in k]
-                if not self._demonstration_issues:
+                if not self._demonstration_issues: # If no specific repository specified or invalid repository specified
                     print(f"{self._pipeline_repo} is either not a file or not a valid identifier in SWE Bench, setting demostration PRs to all SWE Bench PRs")
                     self._demonstration_issues = [v for k, v in self._pipeline_prompts.swebench_prs.items()]
-        elif self._pipeline:
+        elif self._pipeline: # Case 2. Handle no specific demonstration issues specified
             self._demonstration_issues = [v for k, v in self._pipeline_prompts.swebench_prs.items()]
-        else:
+        else: # Case 3. Handle case of not using SVG pipeline (do nothing)
             self._demonstration_issues = None
         if self._demonstration_issues:
             print(f"{len(self._demonstration_issues)} demonstration issues loaded")
@@ -280,7 +296,7 @@ class RunBatch:
             print(f"Check Trajectory Against Rollout One Prompt: {self._pipeline_prompts.check_synthetic_traj_prompt}")
             print(f"SVG Rollout One Prompt (first idx): {self._pipeline_prompts.rollout_one_prompts[0]}")
             print(f"Demonstration Issue (first idx): {self._demonstration_issues[0]}")
-        ### Changes
+        ### Changes ###
 
     @property
     def _model_id(self) -> str:
@@ -321,6 +337,7 @@ class RunBatch:
             skip_id=config.skip_id,
             pipeline=config.pipeline,
             pipeline_repo=config.pipeline_repo,
+            pipeline_yaml=config.pipeline_yaml,
             ### Changes
         )
         if isinstance(config.instances, SWEBenchInstances) and config.instances.evaluate:
@@ -368,8 +385,6 @@ class RunBatch:
                     self.logger.info("Stopping loop over instances")
                     break
 
-    ### Changes
-    # We modify this to retry the trajectory based on failures related to OS, CPU, network instability
     def main_multi_worker(self) -> None:
         add_logger_names_to_stream_handlers()
         # Set all stream handlers to WARNING and set everything where we want to have
@@ -380,7 +395,10 @@ class RunBatch:
         with Live(self._progress_manager.render_group):
             with ThreadPoolExecutor(max_workers=self._num_workers) as executor:
                 tasks_to_process = {executor.submit(self.run_instance, instance) for instance in self.instances}
-
+                
+                ### Changes ###
+                # We modify this to retry the trajectory based on failures related to OS, CPU, network instability.
+                # We do this by returning a None from run_instance() on successes, and the instance being run on failures.
                 try:
                     while tasks_to_process:
                         # Wait for at least one task in our set to finish.
@@ -399,6 +417,7 @@ class RunBatch:
                         # 2. For the next loop, our set of tasks to process is now the
                         #    set of tasks that were already pending plus any new ones we just added.
                         tasks_to_process = pending_tasks
+                ### Changes ###
                 except (KeyboardInterrupt, _BreakLoop):
                     msg = (
                         "Received keyboard interrupt, waiting for running instances "
@@ -409,9 +428,12 @@ class RunBatch:
                 finally:
                     self._progress_manager.print_report()
 
-    # Changes
     def run_instance(self, instance: BatchInstance) -> None:
+        ### Changes ###
+        # Log as an error for easier debugging
         self.logger.error("Running on instance %s", instance.problem_statement.id)
+        ### Changes ###
+
         register_thread_name(instance.problem_statement.id)
         self._add_instance_log_file_handlers(instance.problem_statement.id, multi_worker=self._num_workers > 1)
         # Let's add some randomness to avoid any potential race conditions or thundering herd
@@ -427,20 +449,26 @@ class RunBatch:
 
         # Either catch and silence exception, or raise _BreakLoop to stop the loop
         # over the instances
+
+        ### Changes ###
+        # Implement logic for skip_id and keep_id, skipping or running on tasks based on instance id subword matching
         run_on_this = (self._skip_id[0] == "" or not any(id in instance.problem_statement.id for id in self._skip_id)) and \
                 (self._keep_id[0] == "" or any(id in instance.problem_statement.id for id in self._keep_id))
+        ### Changes ###
 
+        ### Changes ###
+        # We add top level exception handling to catch certain timeout errors and retry automatically.
+        # These changes tie directly into main_multi_worker().
         return_instance_for_retry = False
         if "repo" in instance.problem_statement.extra_fields:
             instance.problem_statement.extra_fields.pop("repo")
         try:
-            ### Changes
+            # Handle running SVG pipeline or normal SWE-agent.
             if run_on_this:
                 if self._pipeline:
                     result = self._run_instance_pipeline(instance)
                 else:
                     result = self._run_instance(instance)
-            ### Changes
         except KeyboardInterrupt:
             raise _BreakLoop
         except (SystemExit, ModelConfigurationError, TotalCostLimitExceededError) as e:
@@ -454,6 +482,7 @@ class RunBatch:
             self._progress_manager.on_uncaught_exception(instance.problem_statement.id, e)
             if self._raise_exceptions:
                 raise
+            # Define the exceptions to handle and retry on.
             if (isinstance(e, CalledProcessError) 
                 or isinstance(e, ConnectionError) 
                 or isinstance(e, HTTPError)
@@ -476,12 +505,15 @@ class RunBatch:
             self._progress_manager.update_exit_status_table()
             self._remove_instance_log_file_handlers(instance.problem_statement.id)
         if return_instance_for_retry:
+            # Return the instance being run if we want to retry
             return instance
         else:
+            # Return None if we do not want to retry
             return
-    # Changes
+        ### Changes ###
 
-    ### Changes
+    ### Changes ###
+    # Added helper for creating synthetic issues from demonstration PRs
     def create_synth_inst(self, system_prompt, prompt, steps, example_pr, base_url, base_model):
         retry_max = 10
         try:
@@ -517,7 +549,15 @@ class RunBatch:
             # Catch any remaining exceptions
             print(e)
             return None
+    ### Changes ###
 
+    ### Changes ###
+    # This is the main SVG pipeline logic.
+    # There are 4 key steps:
+    # Step 1: Randomly sample a random, vague prompt to fix a bug for SVG Rollout 1
+    # Step 2: Run Rollout 1
+    # Step 3: Grade the rollout and generate a synthetic issue
+    # Step 4: Finish if Rollout 1 addresses the vague prompt. Otherwise, retry.
     def _run_instance_pipeline(self, instance: BatchInstance) -> AgentRunResult:
         retries = 3
         for i in range(retries):
@@ -555,12 +595,14 @@ class RunBatch:
             is_good_patch = False
             try:
                 # Here are different prompts
+                # Step 1
                 agent.templates.instance_template = random.sample(self._pipeline_prompts.rollout_one_prompts, 1)[0]
 
                 # We add handling to load a previous simulated trajectory in directly as context.
                 extra_fields = instance.problem_statement.get_extra_fields()
                 env.start()
                 self._chooks.on_instance_start(index=0, env=env, problem_statement=instance.problem_statement)
+                # Step 2
                 result = agent.run(
                     problem_statement=instance.problem_statement,
                     env=env,
@@ -572,6 +614,7 @@ class RunBatch:
                 agent_trajectory = parse_trajectory(result.trajectory)
                 while True:
                     try:
+                        # Step 3
                         is_good_patch_response = pp_query(system="You are a helpful assistant who can analyze code.", 
                                                             prompt=self._pipeline_prompts.check_synthetic_traj_prompt,
                                                             model=self.agent_config.model.name,
@@ -591,6 +634,7 @@ class RunBatch:
                         steps_truncation += len(agent_trajectory) // 4
                         if is_good_patch_retry == 0:
                             break
+                # Step 4
                 synth_pr = self.create_synth_inst(system_prompt="You are a helpful assistant who can analyze code.",
                                                     prompt=self._pipeline_prompts.synthetic_traj_prompt,
                                                     steps=agent_trajectory[steps_truncation:],
@@ -615,6 +659,7 @@ class RunBatch:
         save_predictions(self.output_dir, instance.problem_statement.id, result)
         self._chooks.on_instance_completed(result=result)
         return result
+    ### Changes ###
 
     def _run_instance(self, instance: BatchInstance) -> AgentRunResult:
         output_dir = Path(self.output_dir) / instance.problem_statement.id
@@ -685,12 +730,13 @@ class RunBatch:
                 self.logger.warning(f"Found existing trajectory with no exit status: {log_path}. Removing.")
                 log_path.unlink()
                 return False
-            # Changes
+            ### Changes ###
+            # If there was some error in the trajectory (e.g. API fails) then we rerun the instance
             if "exit_error" in exit_status:
                 self.logger.warning(f"Found existing trajectory with exit error: {log_path}. Removing.")
                 log_path.unlink()
                 return False
-            # Changes
+            ### Changes ###
         except Exception as e:
             self.logger.error(f"Failed to check existing trajectory: {log_path}: {e}. Removing.")
             # If we can't check the trajectory, we will redo it

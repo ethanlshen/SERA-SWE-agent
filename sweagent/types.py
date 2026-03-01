@@ -100,3 +100,6 @@ class AgentInfo(TypedDict, total=False):
 class AgentRunResult(BaseModel):
     info: AgentInfo
     trajectory: Trajectory
+    ### Changes ###
+    # Added agent_history field
+    agent_history: list

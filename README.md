@@ -1,3 +1,13 @@
+# Modifications for SERA
+We make modifications in five files:
+- A new utils file in `sweagent/run/sera_sweagent_utils.py`
+- Major SVG pipeline logic in `sweagent/run/run_batch.py`
+- Slightly modify return logic in `sweagent/agent/models.py`
+- Slightly modify AgentRunResult in `sweagent/types.py`
+- Slightly modify tool implementation in `tools/diff_state/bin/_state_diff_state`
+
+Changes are surrounded by ### Changes ### comments throughout the codebase.
+
 <p align="center">
   <a href="https://swe-agent.com/latest/">
     <img src="assets/swe-agent-banner.png" alt="swe-agent.com" style="height: 7em" />

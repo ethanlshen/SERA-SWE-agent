@@ -18,13 +18,16 @@ def main() -> None:
 
     patch_path = Path("/root/model.patch")
 
+    ### Changes ###
+    # Remove f-string to be compatible with early python versions
     subprocess.run(
-        f"git add -A && git diff --cached > {patch_path}",
+        "git add -A && git diff --cached > " + str(patch_path),
         shell=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         cwd=repo_root,
     )
+    ### Changes ###
 
     patch = patch_path.read_text(errors="backslashreplace")
     state["diff"] = patch.strip()
